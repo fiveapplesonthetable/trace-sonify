@@ -114,24 +114,37 @@ def tp_query(shell, trace, sql):
 
 
 # --------------------------------------------------------------------------
-# name -> pitch (deterministic). Major pentatonic over a few octaves.
+# name -> pitch (deterministic, consistent across traces -> aural signature).
+#
+# A name is hashed (md5) and the hash indexes a fixed palette of MIDI notes.
+# The palette is a major-pentatonic scale spanning several octaves, so:
+#   - distinct names land on distinct, well-separated, *consonant* pitches
+#     (no random dissonance, and far more than the old 10-note space);
+#   - the SAME name always gives the SAME pitch, in any trace.
+# Slice depth is rendered as TIMBRE (added harmonics), not pitch, so depth and
+# name are independent — depth never collides a name onto another's note.
 # --------------------------------------------------------------------------
-PENT = [0, 2, 4, 7, 9]  # semitone offsets within an octave
+def _palette(lo_oct, hi_oct):
+    # Chromatic (all 12 semitones) per octave: prioritise *distinguishability*
+    # (many distinct pitches) over consonance — it doesn't need to sound pretty,
+    # it needs different operations to sound clearly different.
+    return [12 * o + d for o in range(lo_oct, hi_oct + 1) for d in range(12)]
+
+
+SLICE_PALETTE = _palette(3, 8)    # 72 notes, ~130 Hz .. 3.3 kHz
+COUNTER_PALETTE = _palette(1, 3)  # 36 low notes, beneath the slices
 
 
 def _hash(name):
     return int(hashlib.md5(name.encode("utf-8", "replace")).hexdigest(), 16)
 
 
-def name_to_midi(name, octave_base, octave_span=2):
-    h = _hash(name)
-    deg = PENT[h % len(PENT)]
-    octv = (h // len(PENT)) % octave_span
-    return octave_base * 12 + octv * 12 + deg
-
-
 def midi_to_freq(midi):
     return 440.0 * 2 ** ((midi - 69) / 12.0)
+
+
+def name_to_freq(name, palette):
+    return midi_to_freq(palette[_hash(name) % len(palette)])
 
 
 # --------------------------------------------------------------------------
@@ -152,8 +165,7 @@ def render_slice_track(events, total_samples, sr):
     """events: list of (start_s, dur_s, depth, name) already in audio time."""
     buf = np.zeros(total_samples, dtype=np.float32)
     for start_s, dur_s, depth, name in events:
-        midi = name_to_midi(name, octave_base=4 + min(depth, 4))
-        f = midi_to_freq(midi)
+        f = name_to_freq(name, SLICE_PALETTE)           # pitch from name
         start = int(start_s * sr)
         length = max(int(dur_s * sr), int(0.006 * sr))  # >=6ms; resolves 16ms frames
         end = min(start + length, total_samples)
@@ -161,12 +173,12 @@ def render_slice_track(events, total_samples, sr):
             continue
         n = end - start
         t = np.arange(n, dtype=np.float32) / sr
+        # depth -> timbre: deeper nesting adds harmonics (brighter), leaving
+        # pitch free to encode the name alone.
         wave = np.sin(2 * np.pi * f * t)
-        wave += 0.3 * np.sin(2 * np.pi * 2 * f * t)            # 2nd harmonic
-        if depth >= 2:
-            wave += 0.15 * np.sin(2 * np.pi * 3 * f * t)       # richer when deep
-        amp = 0.5 / (1.0 + 0.3 * depth)
-        buf[start:end] += amp * adsr(n, sr) * wave
+        for h in range(2, 2 + min(depth, 5)):
+            wave += (0.5 / h) * np.sin(2 * np.pi * h * f * t)
+        buf[start:end] += 0.45 * adsr(n, sr) * wave
     return buf
 
 
@@ -185,7 +197,7 @@ def render_counter_track(samples, total_samples, sr, name):
         e = max(0, min(e, total_samples))
         if e > s:
             amp_env[s:e] = 0.08 + 0.55 * float((val - vmin) / rng)
-    f = midi_to_freq(name_to_midi(name, octave_base=2))  # low drone
+    f = name_to_freq(name, COUNTER_PALETTE)  # low drone, pitch from counter name
     t = np.arange(total_samples, dtype=np.float32) / sr
     wave = np.sin(2 * np.pi * f * t) + 0.4 * np.sin(2 * np.pi * 2 * f * t)
     return amp_env * wave
@@ -274,6 +286,13 @@ def main():
     ap.add_argument("--max-tracks", type=int, default=24,
                     help="cap number of busiest tracks sonified (default 24)")
     ap.add_argument("--no-master", action="store_true", help="skip the master mix")
+    ap.add_argument("--merge", action="store_true",
+                    help="append the audio to the ORIGINAL trace (keeps every "
+                         "process/thread/track descriptor) and time-align it to "
+                         "the original timeline. Default writes audio only.")
+    ap.add_argument("--colormap", default="intensity",
+                    help="spectrogram color mode (intensity, magma, viridis, "
+                         "fire, rainbow, cool, ...); default intensity")
     a = ap.parse_args()
 
     sr = a.rate
@@ -282,15 +301,26 @@ def main():
     b = tp_query(a.tp_shell, a.trace, "SELECT start_ts AS s, end_ts AS e FROM trace_bounds")
     t0, t1 = int(b[0]["s"]), int(b[0]["e"])
     span = (t1 - t0) or 1
-    D = a.duration if a.duration else (span / 1e9) / a.speed
+    if a.merge:
+        # Real-time, absolute placement so the waveform lines up with the
+        # original slices/counters on the same timeline.
+        if a.duration or a.speed != 1.0:
+            print("note: --merge ignores --speed/--duration (aligns to the "
+                  "original timeline)", file=sys.stderr)
+        D, scale, base_ns = span / 1e9, 1e-9, t0
+    else:
+        D = a.duration if a.duration else (span / 1e9) / a.speed
+        scale, base_ns = D / span, 0
     total = int(D * sr)
-    scale = D / span  # ns -> audio seconds (linear & absolute)
 
-    # Busiest slice tracks (by slice count), with friendly names.
+    # Busiest slice tracks (by slice count), named by their descriptor
+    # hierarchy (process / thread) so streams map back to their source track.
     slice_tracks = tp_query(a.tp_shell, a.trace, f"""
       SELECT track_id, cnt,
         COALESCE(
-          (SELECT th.name FROM thread_track tt JOIN thread th USING(utid) WHERE tt.id=s.track_id),
+          (SELECT COALESCE(p.name||' / ','')||th.name
+             FROM thread_track tt JOIN thread th USING(utid)
+             LEFT JOIN process p USING(upid) WHERE tt.id=s.track_id),
           (SELECT 'tid '||th.tid FROM thread_track tt JOIN thread th USING(utid) WHERE tt.id=s.track_id),
           (SELECT p.name FROM process_track pt JOIN process p USING(upid) WHERE pt.id=s.track_id),
           (SELECT name FROM track WHERE id=s.track_id),
@@ -309,7 +339,6 @@ def main():
           file=sys.stderr)
 
     tmpdir = tempfile.mkdtemp(prefix="sonify_")
-    base_ns = 0
     streams = []          # (name, float buffer)
 
     for row in slice_tracks:
@@ -340,6 +369,8 @@ def main():
     master = soft_limit(master, 0.95)
 
     out = bytearray()
+    if a.merge:
+        out += open(a.trace, "rb").read()   # keep the whole original trace
     sid = 0
     if not a.no_master:
         out += encode_stream(master, sr, sid, "MASTER (mix)", base_ns, tmpdir)
@@ -348,14 +379,15 @@ def main():
         out += encode_stream(buf, sr, sid, name[:80], base_ns, tmpdir)
         sid += 1
     open(a.out, "wb").write(out)
-    print(f"wrote {a.out}: {sid} audio streams ({D:.1f}s)", file=sys.stderr)
+    print(f"wrote {a.out}: {sid} audio streams ({D:.1f}s)"
+          + (" merged into the original trace" if a.merge else ""), file=sys.stderr)
 
     if a.spectrogram:
         mw = os.path.join(tmpdir, "master.wav")
         _write_wav(mw, (np.clip(master, -1, 1) * 32767).astype("<i2"), sr)
         subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
                         "-i", mw, "-lavfi",
-                        "showspectrumpic=s=1600x600:legend=1:scale=log",
+                        f"showspectrumpic=s=1600x600:legend=1:scale=log:color={a.colormap}",
                         "-frames:v", "1", a.spectrogram], check=True)
         print(f"wrote spectrogram {a.spectrogram}", file=sys.stderr)
 
