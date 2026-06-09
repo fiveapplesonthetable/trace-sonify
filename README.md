@@ -187,7 +187,8 @@ Then drag the output into <https://ui.perfetto.dev>.
 | `--spectrogram PNG` | – | also render a spectrogram of the master |
 | `--colormap` | `intensity` | spectrogram colours (`intensity`, `magma`, `viridis`, `fire`, `rainbow`, `cool`, …) |
 | `--rate HZ` | `32000` | sample rate |
-| `--max-tracks N` | `24` | sonify the N busiest slice tracks and N busiest counters |
+| `--per-process` | off | one stream per **process** (mix all its threads' slices) instead of one per thread track |
+| `--max-tracks N` | `24` | sonify the N busiest tracks/processes and N busiest counters |
 | `--no-master` | off | skip the mixed master stream |
 | `--tp-shell PATH` | `$TP_SHELL` | `trace_processor_shell` binary |
 

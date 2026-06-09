@@ -284,7 +284,10 @@ def main():
                     help="also write a Shazam-style spectrogram PNG of the master")
     ap.add_argument("--rate", type=int, default=32000, help="sample rate")
     ap.add_argument("--max-tracks", type=int, default=24,
-                    help="cap number of busiest tracks sonified (default 24)")
+                    help="cap number of busiest tracks/processes sonified (default 24)")
+    ap.add_argument("--per-process", action="store_true",
+                    help="one stream per PROCESS (mix all its threads' slices) "
+                         "instead of one per thread track")
     ap.add_argument("--no-master", action="store_true", help="skip the master mix")
     ap.add_argument("--merge", action="store_true",
                     help="append the audio to the ORIGINAL trace (keeps every "
@@ -341,15 +344,36 @@ def main():
     tmpdir = tempfile.mkdtemp(prefix="sonify_")
     streams = []          # (name, float buffer)
 
-    for row in slice_tracks:
-        tid = row["track_id"]
-        ev = tp_query(a.tp_shell, a.trace,
-                      f"SELECT ts,dur,depth,COALESCE(name,'?') AS name "
-                      f"FROM slice WHERE track_id={tid} ORDER BY ts")
+    if a.per_process:
+        groups = tp_query(a.tp_shell, a.trace, f"""
+          SELECT p.upid AS gid,
+                 COALESCE(p.name, 'pid '||p.pid, 'upid '||p.upid) AS name,
+                 COUNT(*) cnt
+          FROM slice s JOIN thread_track tt ON tt.id=s.track_id
+          JOIN thread th USING(utid) JOIN process p USING(upid)
+          GROUP BY p.upid ORDER BY cnt DESC LIMIT {a.max_tracks}
+        """)
+        print(f"per-process: {len(groups)} processes", file=sys.stderr)
+    else:
+        groups = slice_tracks
+
+    for row in groups:
+        if a.per_process:
+            ev = tp_query(a.tp_shell, a.trace,
+                          f"SELECT s.ts,s.dur,s.depth,COALESCE(s.name,'?') AS name "
+                          f"FROM slice s JOIN thread_track tt ON tt.id=s.track_id "
+                          f"JOIN thread th USING(utid) WHERE th.upid={row['gid']} "
+                          f"ORDER BY s.ts")
+            label = f"{row['name']} [process]"
+        else:
+            ev = tp_query(a.tp_shell, a.trace,
+                          f"SELECT ts,dur,depth,COALESCE(name,'?') AS name "
+                          f"FROM slice WHERE track_id={row['track_id']} ORDER BY ts")
+            label = f"{row['name']} [slices]"
         events = [((int(e["ts"]) - t0) * scale, max(int(e["dur"]), 0) * scale,
                    int(e["depth"]), e["name"]) for e in ev]
         buf = soft_limit(render_slice_track(events, total, sr))
-        streams.append((f"{row['name']} [slices]", buf))
+        streams.append((label, buf))
 
     for row in counter_tracks:
         tid = row["track_id"]
